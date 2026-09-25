@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0b0a1c">
+<title>Pocket Plunder</title>
+<link rel="icon" href="assets/img/crystal.png">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div id="stage">
+  <canvas id="cv"></canvas>
+
+  <!-- loading -->
+  <div id="loading" class="screen show">
+    <div class="load-box"><div class="load-title">Pocket Plunder</div><div class="bar"><i id="loadbar"></i></div></div>
+  </div>
+
+  <!-- title -->
+  <div id="title" class="screen">
+    <img class="logo" src="assets/img/logo.png" alt="Pocket Plunder">
+    <div class="tag">A tiny thief. A pirate ship. A lighthouse gone dark.</div>
+    <button class="btn big" id="btnPlay">Play</button>
+    <div class="foot">A D walk &middot; W S climb &middot; E hide / grab &middot; H hint &middot; Esc pause</div>
+  </div>
+
+  <!-- map / level select -->
+  <div id="map" class="screen">
+    <div id="nodes"></div>
+    <div class="map-head"><span id="starTotal">0</span><img src="assets/img/coin.png" alt=""></div>
+    <button class="btn small corner-left" id="btnMapBack">Back</button>
+  </div>
+
+  <!-- level intro -->
+  <div id="intro" class="screen modal">
+    <div class="parch">
+      <div class="lvl-num" id="introNum">Chapter 1</div>
+      <h1 id="introName">Harbor at Midnight</h1>
+      <p id="introText"></p>
+      <div class="tipline" id="introTip"></div>
+      <div class="treasure-preview" id="introStars"></div>
+      <button class="btn big" id="btnGo">Let's go!</button>
+    </div>
+  </div>
+
+  <!-- in-game HUD -->
+  <div id="hud" class="screen">
+    <div class="hud-top">
+      <div class="objective"><div class="lvlname" id="hudName"></div><div id="hudObj"></div></div>
+      <div class="hud-btns">
+        <button class="ibtn" id="btnHint" title="Hint"><svg viewBox="0 0 24 24"><circle cx="10" cy="10" r="6"/><path d="M14.5 14.5 20 20"/></svg></button>
+        <button class="ibtn" id="btnSound" title="Sound"><svg viewBox="0 0 24 24"><path d="M4 9h4l5-4v14l-5-4H4z"/><path class="wave" d="M16 8.5a5 5 0 0 1 0 7M18.5 6a8.5 8.5 0 0 1 0 12"/></svg></button>
+        <button class="ibtn" id="btnPause" title="Pause"><svg viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></svg></button>
+      </div>
+    </div>
+    <div class="hud-bottom">
+      <div class="inv" id="inv"></div>
+      <div class="treasures" id="treasures"></div>
+    </div>
+    <div class="hearts" id="hearts"></div>
+    <div class="progress" id="progress"><i></i><img src="assets/img/lighthouse_lit.png" alt=""></div>
+  </div>
+
+  <div id="toast"></div>
+  <div id="tooltip"></div>
+  <div id="bigtext"></div>
+
+  <!-- pause -->
+  <div id="pause" class="screen modal">
+    <div class="parch small">
+      <h1>Paused</h1>
+      <button class="btn" id="btnResume">Resume</button>
+      <button class="btn alt" id="btnRestart">Restart level</button>
+      <button class="btn alt" id="btnToMap">Treasure map</button>
+    </div>
+  </div>
+
+  <!-- result -->
+  <div id="result" class="screen modal">
+    <div class="parch">
+      <h1 id="resTitle">Level complete!</h1>
+      <div class="stars" id="resStars"></div>
+      <div class="star-labels" id="resLabels"></div>
+      <div class="row">
+        <button class="btn alt" id="btnReplay">Replay</button>
+        <button class="btn" id="btnNext">Next</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ending -->
+  <div id="ending" class="screen modal">
+    <div class="parch wide">
+      <img class="pip-cheer" src="assets/img/pip_cheer.png" alt="">
+      <h1>The lighthouse shines again!</h1>
+      <p>Pip sailed the stolen ship home and set the Great Crystal back in its lamp. Tonight, every ship at sea will find its way safely to harbor.</p>
+      <p class="thanks">Thanks for playing <b>Pocket Plunder</b></p>
+      <div class="stars" id="endStars"></div>
+      <div class="row">
+        <button class="btn alt" id="btnEndMap">Treasure map</button>
+        <button class="btn" id="btnEndTitle">Title screen</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script type="module" src="js/main.js"></script>
+</body>
+</html>

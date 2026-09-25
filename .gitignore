@@ -1,0 +1,4 @@
+.venv/
+assets/raw/
+.claude/
+__pycache__/
