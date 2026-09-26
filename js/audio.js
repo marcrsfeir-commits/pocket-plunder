@@ -142,6 +142,20 @@ export const sfx = {
   whoosh() { puff(0.3, { vol: 0.05, freq: 300, sweep: 1400, q: 0.8 }); },
   win() { [0, 4, 7, 12].forEach((n, i) => pluck(hz(3 + n), i * 0.11, 0.18, 0.6)); [12, 16, 19, 24].forEach((n, i) => chime(hz(3 + n), 0.5 + i * 0.06, 0.07, 1.4)); },
   star(i) { chime(hz(12 + i * 4), 0, 0.14, 1.0); },
+  hop() { marimba(hz(-5), 0, 0.08, 0.12); marimba(hz(2), 0.07, 0.08, 0.14); },
+  lift() { thud(120, 0.25, 0.12); for (let i = 0; i < 4; i++) marimba(hz(-14 + i), i * 0.08, 0.05, 0.1); },
+  creak() { const t = Math.random() * 3; marimba(hz(-10 + t), 0, 0.05, 0.25); },
+  snuff() { puff(0.35, { vol: 0.07, freq: 900, sweep: 200, q: 0.6 }); },
+  relight() { puff(0.25, { vol: 0.06, freq: 2500, sweep: 800, q: 1 }); chime(hz(0), 0.05, 0.05, 0.4); },
+  meow() {
+    if (!ac) return;
+    const t = now(), o = ac.createOscillator(), g = ac.createGain(), out = lp(2600, sfxBus);
+    o.type = 'triangle'; o.frequency.setValueAtTime(700, t); o.frequency.linearRampToValueAtTime(1050, t + 0.12); o.frequency.linearRampToValueAtTime(620, t + 0.45);
+    env(g, t, 0.12, 0.03, 0.45); o.connect(g); g.connect(out); o.start(t); o.stop(t + 0.55);
+    [0, 4, 7].forEach((n, i) => chime(hz(12 + n), 0.3 + i * 0.07, 0.07, 0.8));
+  },
+  bark() { [0, 0.22].forEach(w => { thud(240, 0.12, 0.2, w); puff(0.1, { vol: 0.08, freq: 700, q: 1.5, when: w }); }); },
+  sniff() { [0, 0.12, 0.24].forEach(w => puff(0.08, { vol: 0.05, freq: 2000, q: 2, when: w })); },
   lighthouse() { [0, 7, 12, 16, 19, 24].forEach((n, i) => chime(hz(-2 + n), i * 0.2, 0.1, 2.2)); },
 };
 

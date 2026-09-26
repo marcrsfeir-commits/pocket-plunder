@@ -9,6 +9,15 @@ const NAMES = [
   'bell', 'cage', 'parrot',
   'key', 'crystal', 'coin', 'ruby', 'pearl', 'bottle', 'cloth', 'hook', 'knife', 'crown', 'map_item', 'lantern',
   'ship', 'rowboat', 'cannonball', 'rock', 'lighthouse_dark', 'lighthouse_lit',
+  'bg_hold.jpg', 'bg_brig.jpg', 'bg_rigging.jpg', 'panel1.jpg', 'panel2.jpg', 'panel3.jpg',
+  'dog_idle', 'dog_walk1', 'dog_walk2', 'dog_sniff', 'dog_eat',
+  'grandpa_sit', 'grandpa_idle', 'grandpa_wave', 'grandpa_walk',
+  'mate_idle', 'mate_walk1', 'mate_walk2', 'mate_spy', 'mate_alert',
+  'jailer_idle', 'jailer_walk1', 'jailer_walk2', 'jailer_alert', 'jailer_yawn',
+  'kitten_sit', 'kitten_peek', 'kitten_walk', 'kitten_sleep', 'kitten_leap',
+  'lamp_on', 'lamp_off', 'ham', 'bowl', 'bowl_full', 'keyring', 'pallet', 'knot', 'stool', 'bucket', 'keg', 'cannonballs',
+  'bars1', 'bars2',
+  ...['pirate', 'ninja', 'frog', 'kitty'].flatMap(o => ['idle', 'walk1', 'walk2', 'sneak', 'climb', 'cheer'].map(p => `outfit_${o}_${p}`)),
 ];
 
 export const IMG = {};

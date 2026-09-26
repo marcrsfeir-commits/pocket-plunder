@@ -1,4 +1,5 @@
-// Stealth-level engine: tap-to-move, ladders, hiding, guards with vision, items, noise.
+// Stealth-level engine: WASD movement, ladders & lifts, animated hiding, guards with vision,
+// darkness & lanterns, noise, dogs that sniff, pickpocketing, items, secret kittens.
 import { IMG, drawSprite, spriteSize } from './assets.js';
 import { sfx } from './audio.js';
 
@@ -9,10 +10,20 @@ const CHAR = {
   deckhand: { scale: 0.62 },
   cook: { scale: 0.52 },
   captain: { scale: 0.56 },
+  mate: { scale: 0.54 },
+  jailer: { scale: 0.6 },
+  dog: { scale: 0.5 },
 };
-const PIP_SPEED = 270, CLIMB_SPEED = 230;
+const PIP_SPEED = 270, CLIMB_SPEED = 230, LIFT_SPEED = 150;
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const rand = (a, b) => a + Math.random() * (b - a);
+const lerp = (a, b, t) => a + (b - a) * t;
+const ease = t => t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+const HIDDEN = ['hiding', 'hide'];
+
+// Which Pip outfit is worn (sprite prefix). Set from the wardrobe.
+let PIP = 'pip_';
+export function setOutfit(name) { PIP = !name || name === 'classic' ? 'pip_' : `outfit_${name}_`; }
 
 export class StealthGame {
   constructor(level, hooks) {
@@ -22,27 +33,29 @@ export class StealthGame {
     this.flags = {};
     this.items = [...(level.startItems || [])];
     this.found = [];            // treasures collected
+    this.kitten = false;        // secret kitten found
     this.seen = false;          // for the "ghost" star
     this.over = false;
     this.particles = [];
-    this.bubbles = [];
     this.shake = 0;
+    this.freeze = 0;
+    this.cam = { z: 1, x: W / 2, y: H / 2, tz: 1, tx: W / 2, ty: H / 2 };
     this.hintT = 0;
     this.hover = null;
-    this.ripples = [];
-    this.msgCooldown = 0;
     this.keys = {};
     this.near = null;
 
-    this.objects = level.objects.map(o => ({ ...o, done: false, spark: rand(0.5, 2.5) }));
-    this.ladders = level.ladders.map(l => ({ ...l }));
+    this.objects = level.objects.map(o => ({ ...o, done: false, spark: rand(0.5, 2.5), sq: 0 }));
+    this.ladders = level.ladders.map(l => ({ ...l, restY: this.L.floors[l.bottom].y }));
+    this.lamps = {};
+    for (const l of level.lights || []) if (l.id) this.lamps[l.id] = { ...l, lit: true };
     this.enemies = level.enemies.map(e => this.makeEnemy(e));
 
     const s = level.start;
     this.pl = {
       floor: s.floor, x: s.x, y: this.fy(s.floor), face: s.face || 1,
       state: 'idle', route: [], pending: null, hideObj: null, act: null,
-      animT: 0, stepT: 0, squash: 0, climbFrom: null,
+      animT: 0, stepT: 0, squash: 0, hk: 0, peekT: 2,
     };
     level.init && level.init(this);
   }
@@ -50,18 +63,16 @@ export class StealthGame {
   // ---------- helpers ----------
   fy(f) { return this.L.floors[f].y; }
   has(item) { return this.items.includes(item); }
-  give(item, fromX, fromY) {
-    if (!this.items.includes(item)) this.items.push(item);
-    this.burst(fromX ?? this.pl.x, fromY ?? this.pl.y - 120, '#ffe79a', 16);
-    this.hooks.hud(this);
-  }
   take(item) { this.items = this.items.filter(i => i !== item); this.hooks.hud(this); }
   say(text, time = 2.8) { this.hooks.message(text, time); }
   objective() { return this.L.objective(this); }
+  enemy(id) { return this.enemies.find(e => e.id === id); }
+  obj(id) { return this.objects.find(o => o.id === id); }
+  isHidden() { const p = this.pl; return HIDDEN.includes(p.state) || (p.state === 'unhiding' && p.hk < 0.5); }
 
   makeEnemy(e) {
     const en = { ...e, sus: 0, bubble: null, animT: rand(0, 1), mode: 'idle', waitT: 0, pi: 0, lookT: 0, noiseX: null, zT: 0 };
-    if (e.type === 'deckhand' || e.type === 'cook' || e.type === 'captain') {
+    if (e.patrol) {
       en.face = e.face || 1;
       en.pi = 0;
       this.beginPatrolStep(en);
@@ -75,19 +86,7 @@ export class StealthGame {
     return en;
   }
 
-  // ---------- input ----------
-  objAt(x, y) {
-    let best = null, bestA = Infinity;
-    for (const o of this.objects) {
-      if (!this.isActive(o)) continue;
-      const b = this.objBox(o);
-      if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) {
-        const a = b.w * b.h;
-        if (a < bestA) { best = o; bestA = a; }
-      }
-    }
-    return best;
-  }
+  // ---------- objects ----------
   objBox(o) {
     const fy = this.fy(o.floor) + (o.dy || 0);
     if (o.hit) return { x: o.x - o.hit.w / 2, y: fy + (o.hit.dy || 0) - o.hit.h, w: o.hit.w, h: o.hit.h };
@@ -103,59 +102,38 @@ export class StealthGame {
   }
   isVisible(o) {
     if (o.visibleIf && !o.visibleIf(this)) return false;
-    if (o.done && (o.type === 'pickup')) return false;
+    if (o.done && o.type === 'pickup') return false;
     return true;
+  }
+  hideStyle(o) {
+    if (o.hideStyle) return o.hideStyle;
+    if (o.sprite === 'barrel') return 'barrel';
+    if (o.sprite) return 'sprite';
+    if (o.rect) return 'under';
+    return 'cover';
   }
 
   pointerMove(x, y) {
-    const o = this.over ? null : this.objAt(x, y);
-    this.hover = o;
-    return o ? (o.label || null) : null;
-  }
-
-  tap(x, y) {
-    if (this.over) return;
-    const p = this.pl;
-    if (p.state === 'act') return;
-    const o = this.objAt(x, y);
-    let target;
-    if (o) {
-      target = { floor: o.floor, x: clamp(o.standX ?? o.x, this.L.floors[o.floor].x1, this.L.floors[o.floor].x2), obj: o };
-    } else {
-      target = this.floorAt(x, y);
-      if (!target) return;
+    let best = null, bestA = Infinity;
+    if (!this.over) for (const o of this.objects) {
+      if (!this.isActive(o)) continue;
+      const b = this.objBox(o);
+      if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h && b.w * b.h < bestA) { best = o; bestA = b.w * b.h; }
     }
-    this.ripples.push({ x: target.obj ? x : target.x, y: target.obj ? y : this.fy(target.floor), t: 0 });
-    sfx.tap();
-    if (p.state === 'hide') { this.unhide(); if (target.obj === p.hideObj) return; }
-    if (p.state === 'climb') { p.retarget = target; return; }
-    this.goTo(target);
+    this.hover = best;
+    return best ? (best.label || null) : null;
   }
 
-  floorAt(x, y) {
-    let best = null, bd = Infinity;
-    for (const [id, f] of Object.entries(this.L.floors)) {
-      if (f.enabled && !f.enabled(this)) continue;
-      if (x < f.x1 - 60 || x > f.x2 + 60) continue;
-      // prefer the floor the tap is standing "on": slightly above it counts most
-      const d = y <= f.y + 60 ? (f.y - y) : (y - f.y) * 3;
-      const dd = d < -60 ? 9999 : Math.abs(d);
-      if (dd < bd) { bd = dd; best = id; }
-    }
-    if (!best) return null;
-    const f = this.L.floors[best];
-    return { floor: best, x: clamp(x, f.x1, f.x2) };
-  }
-
+  // ---------- route planning (used by the playtest bot) ----------
   goTo(target) {
     const p = this.pl;
+    if (p.state === 'hide') this.unhide();
     const route = this.plan(p.floor, p.x, target.floor, target.x);
-    if (!route) { this.say("I can't get there from here..."); return; }
+    if (!route) return;
     p.route = route;
     p.pending = target.obj ? target : null;
-    p.state = 'walk';
+    if (p.state !== 'unhiding') p.state = 'walk';
   }
-
   plan(ff, fx, tf, tx) {
     let best = null;
     const walk = (floor, x, cost, path, visited) => {
@@ -174,13 +152,6 @@ export class StealthGame {
     };
     walk(ff, fx, 0, [], new Set([ff]));
     return best && best.path;
-  }
-
-  // ---------- player ----------
-  unhide() {
-    const p = this.pl;
-    p.state = 'idle'; p.hideObj = null; p.squash = 0.25;
-    sfx.unhide();
   }
 
   // ---------- keyboard (WASD) ----------
@@ -203,22 +174,29 @@ export class StealthGame {
     return null;
   }
 
+  startClimb(l, to) {
+    const p = this.pl;
+    p.state = 'climb'; p.climbTo = to; p.climbL = l; p.x = l.x;
+    if (l.style === 'lift') {
+      sfx.lift();
+      if (l.noise) this.makeNoise(l.bottom, l.x, l.noise, 3);
+    }
+  }
+
   tryClimb(dir) {
     const p = this.pl;
-    if (!['idle', 'walk', 'hide'].includes(p.state)) return false;
+    if (!['idle', 'walk'].includes(p.state)) return false;
     const n = this.nearLadder(dir);
     if (!n) return false;
-    if (p.state === 'hide') this.unhide();
     p.kb = false; p.pending = null;
     p.route = [{ t: 'climb', ladder: n.l, to: n.to }];
-    p.x = n.l.x; p.state = 'climb';
-    p.climbFrom = p.floor; p.climbTo = n.to; p.climbX = n.l.x;
+    this.startClimb(n.l, n.to);
     return true;
   }
 
   nearestObj() {
     const p = this.pl;
-    if (!['idle', 'walk', 'hide'].includes(p.state)) return null;
+    if (!['idle', 'walk'].includes(p.state)) return null;
     let best = null, bd = Infinity;
     for (const o of this.objects) {
       if (!this.isActive(o) || o.floor !== p.floor) continue;
@@ -232,7 +210,7 @@ export class StealthGame {
 
   actKey() {
     const p = this.pl;
-    if (p.state === 'hide') { this.unhide(); return; }
+    if (p.state === 'hide' || p.state === 'hiding') { this.unhide(); return; }
     if (!['idle', 'walk'].includes(p.state)) return;
     const o = this.nearestObj();
     if (!o) return;
@@ -240,14 +218,61 @@ export class StealthGame {
     this.interact(o);
   }
 
+  // ---------- hiding ----------
+  enterHide(o) {
+    const p = this.pl;
+    p.hideObj = o; p.state = 'hiding'; p.hk = 0; p.fromX = p.x; p.x = o.x; p.peekT = 2.5;
+    p.hideDur = this.hideStyle(o) === 'barrel' ? 0.55 : 0.42;
+    if (this.hideStyle(o) === 'barrel') sfx.hop(); else sfx.hide();
+  }
+  unhide() {
+    const p = this.pl;
+    if (!p.hideObj) { p.state = 'idle'; return; }
+    const o = p.hideObj, st = this.hideStyle(o);
+    const dir = (this.keys.right ? 1 : 0) - (this.keys.left ? 1 : 0) || p.face || 1;
+    p.face = dir;
+    p.exitX = clamp(o.x + dir * (st === 'barrel' ? 85 : 30), this.L.floors[o.floor].x1, this.L.floors[o.floor].x2);
+    p.state = 'unhiding'; p.hk = 0; p.fromX = p.exitX;
+    p.hideDur = st === 'barrel' ? 0.42 : 0.32;
+    if (st === 'barrel') sfx.hop(); else sfx.unhide();
+  }
+
+  // ---------- player ----------
   updatePlayer(dt) {
     const p = this.pl;
     p.animT += dt;
     p.squash *= Math.pow(0.001, dt);
+    if (p.state === 'hiding') {
+      p.hk += dt / p.hideDur;
+      if (p.hk >= 1) {
+        p.hk = 1; p.state = 'hide';
+        const o = p.hideObj;
+        if (this.hideStyle(o) === 'barrel') { o.sq = 0.35; sfx.hide(); }
+        this.puff(o.x, this.fy(o.floor), 5);
+      }
+      return;
+    }
+    if (p.state === 'hide') {
+      p.peekT -= dt;
+      if (p.peekT < -1.4) p.peekT = rand(2.5, 4.5);
+      if (p.route.length) this.unhide();
+      return;
+    }
+    if (p.state === 'unhiding') {
+      p.hk += dt / p.hideDur;
+      if (p.hk >= 1) {
+        const o = p.hideObj;
+        p.state = 'idle'; p.x = p.exitX; p.hideObj = null; p.squash = 0.25;
+        this.puff(p.x, p.y, 4);
+        if (o && this.hideStyle(o) === 'barrel') o.sq = 0.25;
+        if (p.route.length) p.state = 'walk';
+      }
+      return;
+    }
     const dir = (this.keys.right ? 1 : 0) - (this.keys.left ? 1 : 0);
-    if (!this.over && ['idle', 'walk', 'hide'].includes(p.state)) {
+    if (!this.over && ['idle', 'walk'].includes(p.state)) {
       if (dir) {
-        if (p.state === 'hide') this.unhide();
+        if (p.state === 'idle') this.puff(p.x - dir * 20, p.y, 2);
         p.route = []; p.pending = null; p.state = 'walk'; p.kb = true;
         const f = this.L.floors[p.floor];
         p.face = dir;
@@ -257,7 +282,6 @@ export class StealthGame {
         return;
       }
       if (p.kb && p.state === 'walk') { p.kb = false; p.state = 'idle'; p.squash = 0.12; return; }
-      // holding W/S at a ladder climbs it
       if (p.state === 'idle' && (this.keys.up || this.keys.down) && this.tryClimb(this.keys.up ? -1 : 1)) return;
     }
     if (p.state === 'walk') {
@@ -271,20 +295,21 @@ export class StealthGame {
         p.stepT -= dt;
         if (p.stepT <= 0) { p.stepT = 0.26; sfx.step(); }
       } else if (st.t === 'climb') {
-        p.state = 'climb';
-        p.climbFrom = p.floor; p.climbTo = st.to; p.climbX = st.ladder.x;
+        this.startClimb(st.ladder, st.to);
       }
     } else if (p.state === 'climb') {
       const ty = this.fy(p.climbTo);
       const dy = ty - p.y;
+      const lift = p.climbL.style === 'lift';
       p.stepT -= dt;
-      if (p.stepT <= 0) { p.stepT = 0.2; sfx.climb(); }
+      if (p.stepT <= 0) { p.stepT = lift ? 0.35 : 0.2; lift ? sfx.creak() : sfx.climb(); }
       if (Math.abs(dy) < 3) {
         p.y = ty; p.floor = p.climbTo; p.route.shift(); p.squash = 0.3;
-        if (p.retarget) { const t = p.retarget; p.retarget = null; this.goTo(t); return; }
+        if (lift) p.climbL.restY = ty;
+        this.puff(p.x, p.y, 3);
         if (p.route.length) p.state = 'walk'; else this.arrive();
       } else {
-        p.y += Math.sign(dy) * Math.min(Math.abs(dy), CLIMB_SPEED * dt);
+        p.y += Math.sign(dy) * Math.min(Math.abs(dy), (lift ? LIFT_SPEED : CLIMB_SPEED) * dt);
       }
     } else if (p.state === 'act') {
       p.act.t -= dt;
@@ -311,11 +336,14 @@ export class StealthGame {
     const need = o.requires;
     if (need && !this.has(need)) { this.say(o.needMsg || 'I need something for this...'); return; }
     if (o.requiresFlag && !this.flags[o.requiresFlag]) { this.say(o.needMsg || 'Not yet...'); return; }
+    if (o.follow) {
+      const e = this.enemy(o.follow);
+      if ((p.x - e.x) * e.face > -15 || e.mode === 'alert') { this.say(o.frontMsg || "He'd see me! I have to sneak up from behind."); return; }
+    }
 
     switch (o.type) {
       case 'hide':
-        p.state = 'hide'; p.hideObj = o; p.x = o.x; sfx.hide();
-        if (!this.flags._hidTip) { this.flags._hidTip = true; }
+        this.enterHide(o);
         break;
       case 'pickup':
         this.startAct(o.act || 0.45, () => {
@@ -337,6 +365,7 @@ export class StealthGame {
         this.startAct(o.act || 1.0, () => {
           if (o.consume && need) this.take(need);
           o.done = !o.repeat;
+          if (o.lamp) { this.lamps[o.lamp].lit = false; sfx.snuff(); this.puff(this.lamps[o.lamp].x, this.lamps[o.lamp].y, 6, '#50505a'); }
           o.onDone && o.onDone(this, o);
           if (o.msg) this.say(o.msg);
         }, o.pose || 'sneak');
@@ -360,12 +389,17 @@ export class StealthGame {
 
   collect(o, x, y) {
     const item = o.gives;
-    if (o.treasure) {
+    if (o.kitten) {
+      this.kitten = true;
+      sfx.meow();
+      for (let i = 0; i < 8; i++) this.particles.push({ k: 'heart', x: x + rand(-40, 40), y: y + rand(-30, 10), vx: rand(-30, 30), vy: rand(-120, -60), life: 1.4, max: 1.4, r: rand(12, 20) });
+      this.hooks.fly('kitten_sit', x, y, 'kitten');
+    } else if (o.treasure) {
       this.found.push(item);
       sfx.treasure();
       this.burst(x, y, '#ffd84a', 26);
       this.hooks.fly(item, x, y, 'treasure');
-    } else {
+    } else if (item) {
       sfx.pick();
       this.items.push(item);
       this.burst(x, y, '#bfe8ff', 18);
@@ -381,11 +415,18 @@ export class StealthGame {
     for (const e of this.enemies) {
       if (e.floor !== floor) continue;
       if (e.type === 'sleeper') { e.cycleT = e.sleep; continue; }
-      if (!e.patrol) continue;
+      if (!e.patrol || e.mode === 'eat') continue;
       if (Math.abs(e.x - x) > radius) continue;
       e.mode = 'investigate'; e.noiseX = x; e.investT = time;
       e.bubble = { text: '?', t: 1.4 };
     }
+  }
+
+  /** Send the dog to a bowl to eat. */
+  feedDog(dogId, x, time = 10) {
+    const d = this.enemy(dogId);
+    d.mode = 'investigate'; d.noiseX = x; d.investT = 0; d.eatNext = time; d.sus = 0;
+    d.bubble = { text: '!', t: 1 };
   }
 
   win(o) {
@@ -395,22 +436,26 @@ export class StealthGame {
     p.state = 'cheer'; p.animT = 0;
     sfx.win();
     this.burst(p.x, p.y - 100, '#ffe79a', 40);
-    setTimeout(() => this.hooks.win(this, o), 1300);
+    this.cam.tz = 1.12; this.cam.tx = p.x; this.cam.ty = p.y - 120;
+    setTimeout(() => this.hooks.win(this, o), 1400);
   }
 
   caught(e) {
     if (this.over) return;
     this.over = true;
     const p = this.pl;
-    e.mode = 'alert';
+    if (p.state === 'hide' || p.state === 'hiding' || p.state === 'unhiding') { p.state = 'idle'; p.x = p.hideObj ? p.hideObj.x : p.x; p.hideObj = null; }
+    e.mode = 'alert'; e.animT = 0;
     if (e.face !== undefined && e.type !== 'beam') e.face = p.x >= e.x ? 1 : -1;
     e.bubble = { text: '!', t: 99 };
     if (e.type === 'parrot') { sfx.squawk(); this.say('SQUAWK! INTRUDER! INTRUDER!', 2); }
+    else if (e.type === 'dog') { sfx.bark(); this.say('WOOF! WOOF!', 2); }
     else sfx.alert();
     sfx.caught();
     p.state = 'caught'; p.animT = 0;
-    this.shake = 22;
-    setTimeout(() => this.hooks.caught(this, e), 1500);
+    this.shake = 18; this.freeze = 0.22;
+    this.cam.tz = 1.35; this.cam.tx = (p.x + (e.bx ?? e.x)) / 2; this.cam.ty = p.y - 110;
+    setTimeout(() => this.hooks.caught(this, e), 1600);
   }
 
   // ---------- enemies ----------
@@ -420,10 +465,26 @@ export class StealthGame {
     else e.mode = 'walk';
   }
 
+  inLight(x, y) {
+    for (const l of Object.values(this.lamps)) {
+      if (!l.lit) continue;
+      const dx = x - (l.lx ?? l.x), dy = (y - 70) - (l.ly ?? l.y), r = l.r * 0.9;
+      if (dx * dx + dy * dy < r * r) return true;
+    }
+    for (const e of this.enemies) if (e.lantern && Math.abs(e.x - x) < 170 && e.floor === this.pl.floor) return true;
+    return false;
+  }
+
   canSee(e) {
     const p = this.pl;
-    if (p.state === 'hide' || p.state === 'caught' || this.over) return 0;
-    // on ladders you only count as "on" a floor when your feet are near it
+    if (p.state === 'caught' || this.over) return 0;
+    // dogs smell you, even hidden (but not while they're eating)
+    if (e.type === 'dog' && (e.mode === 'eat' || e.eatNext)) return 0; // busy with dinner
+    if (e.type === 'dog' && e.smell && p.floor === e.floor && p.state !== 'climb') {
+      const d = Math.abs(p.x - e.x);
+      if (d < e.smell) return 0.6 + 0.4 * (1 - d / e.smell);
+    }
+    if (this.isHidden()) return 0;
     if (p.state === 'climb') { if (Math.abs(p.y - this.fy(e.floor)) > 70) return 0; }
     else if (p.floor !== e.floor) return 0;
     const dx = p.x - e.x;
@@ -431,12 +492,11 @@ export class StealthGame {
       if (e.phase !== 'awake') return 0;
       return Math.abs(dx) < e.range ? 1 - Math.abs(dx) / e.range : 0;
     }
-    if (e.type === 'beam') {
-      return Math.abs(p.x - e.bx) < e.width / 2 ? 1 : 0;
-    }
+    if (e.type === 'beam') return Math.abs(p.x - e.bx) < e.width / 2 ? 1 : 0;
     if (e.type === 'parrot' && e.covered) return 0;
-    const r = this.range(e);
+    let r = this.range(e);
     if (r <= 0) return 0;
+    if (this.L.dark && !this.inLight(p.x, p.y)) r *= 0.42;
     if (dx * e.face < -30) return 0;
     if (Math.abs(dx) > r) return 0;
     return 1 - Math.abs(dx) / r;
@@ -444,17 +504,19 @@ export class StealthGame {
 
   range(e) {
     if (e.type === 'parrot') return e.covered ? 0 : e.range;
+    if (e.mode === 'eat' || e.mode === 'alert' || e.mode === 'relight') return e.mode === 'relight' ? e.range * 0.5 : 0;
     if (e.mode === 'wait' && e.patrol) { const s = e.patrol[e.pi]; if (s.range !== undefined) return s.range; }
-    if (e.mode === 'alert') return 0;
     return e.range;
   }
 
   pose(e) {
-    if (e.mode === 'alert') return 'alert';
+    if (e.mode === 'alert') return e.type === 'dog' ? 'idle' : 'alert';
+    if (e.mode === 'eat') return 'eat';
     if (e.mode === 'walk' || e.mode === 'investigate') {
-      const f = Math.floor(e.animT * 7) % 4;
+      const f = Math.floor(e.animT * (e.type === 'dog' ? 9 : 7)) % 4;
       return ['walk1', 'idle', 'walk2', 'idle'][f];
     }
+    if (e.mode === 'search' && e.type === 'dog') return 'sniff';
     if (e.mode === 'wait' && e.patrol) { const s = e.patrol[e.pi]; if (s.pose) return s.pose; }
     return 'idle';
   }
@@ -469,25 +531,38 @@ export class StealthGame {
       if (e.mode === 'walk' || e.mode === 'investigate') {
         const tx = e.mode === 'investigate' ? e.noiseX : e.patrol[e.pi].x;
         const dx = tx - e.x;
+        // lantern-carriers relight any snuffed lamp they pass
+        if (e.relights && e.mode === 'walk') {
+          for (const l of Object.values(this.lamps)) {
+            if (!l.lit && l.floor === e.floor && Math.abs(l.x - e.x) < 25) {
+              e.mode = 'relight'; e.waitT = 1.8; e.relightLamp = l; e.bubble = { text: '?', t: 1.8 };
+              return;
+            }
+          }
+        }
         if (Math.abs(dx) < 3) {
           e.x = tx;
-          if (e.mode === 'investigate') { e.mode = 'search'; e.waitT = e.investT; e.lookT = 0; }
-          else { e.mode = 'wait'; const s = e.patrol[e.pi]; e.waitT = s.wait || 1; e.lookT = 0; if (s.face) e.face = s.face; }
+          if (e.mode === 'investigate') {
+            if (e.eatNext) { e.mode = 'eat'; e.waitT = e.eatNext; e.eatNext = 0; }
+            else { e.mode = 'search'; e.waitT = e.investT; e.lookT = 0; }
+          } else { e.mode = 'wait'; const s = e.patrol[e.pi]; e.waitT = s.wait || 1; e.lookT = 0; if (s.face) e.face = s.face; }
         } else {
           e.face = Math.sign(dx);
           e.x += Math.sign(dx) * Math.min(Math.abs(dx), speed * dt);
         }
-      } else if (e.mode === 'wait' || e.mode === 'search') {
+      } else {
         e.waitT -= dt; e.lookT += dt;
         const s = e.patrol[e.pi];
         if (e.mode === 'search' && e.lookT > 1.1) { e.lookT = 0; e.face *= -1; }
         if (e.mode === 'wait' && s.look && e.lookT > (s.wait || 1) * 0.5 && !e.looked) { e.looked = true; e.face *= -1; }
-        if (e.mode === 'wait' && s.pose === 'sleep') { e.zT -= dt; if (e.zT <= 0) { e.zT = 0.7; this.zzz(e.x + 30 * e.face, this.fy(e.floor) - 200); } }
+        if (e.mode === 'wait' && (s.pose === 'sleep' || s.doze)) { e.zT -= dt; if (e.zT <= 0) { e.zT = 0.7; this.zzz(e.x + 30 * e.face, this.fy(e.floor) - 200); } }
+        if (e.mode === 'eat') { e.zT -= dt; if (e.zT <= 0) { e.zT = 0.5; this.popText('nom', e.x + e.face * 40, this.fy(e.floor) - 110, 28); } }
         if (e.waitT <= 0) {
+          if (e.mode === 'relight') { e.relightLamp.lit = true; sfx.relight(); e.bubble = { text: 'hm', t: 1 }; this.hooks.message && this.say('Uh oh... he relit the lantern.', 2); }
           e.looked = false;
           if (e.mode === 'wait') e.pi = (e.pi + 1) % e.patrol.length;
+          if (e.mode === 'wait' && s.pose === 'sleep') e.bubble = { text: '...', t: 0.8 };
           e.mode = 'walk';
-          if (s.pose === 'sleep' && e.mode === 'walk') { e.bubble = { text: '...', t: 0.8 }; }
         }
       }
     } else if (e.type === 'sleeper') {
@@ -495,8 +570,8 @@ export class StealthGame {
       e.cycleT = (e.cycleT + dt) % total;
       const ph = e.cycleT < e.sleep ? 'sleep' : e.cycleT < e.sleep + e.stir ? 'stir' : 'awake';
       if (ph !== e.phase) {
-        if (ph === 'awake') { e.bubble = { text: '?', t: e.awake }; }
-        if (ph === 'stir') { e.bubble = { text: '~', t: e.stir }; }
+        if (ph === 'awake') e.bubble = { text: '?', t: e.awake };
+        if (ph === 'stir') e.bubble = { text: '~', t: e.stir };
         e.phase = ph;
       }
       if (ph === 'sleep') { e.zT -= dt; if (e.zT <= 0) { e.zT = 0.8; this.zzz(e.x + 40, this.fy(e.floor) + (e.dy || 0) - 140); } }
@@ -511,16 +586,15 @@ export class StealthGame {
       }
     }
 
-    // detection
     const v = this.canSee(e);
     if (v > 0) {
       const before = e.sus;
-      e.sus += dt * (e.type === 'beam' ? 3.2 : 2.3 + 7 * v * v);
-      if (before === 0) { sfx.suspicious(); e.bubble = { text: '?', t: 0.8 }; }
+      e.sus += dt * (e.type === 'beam' ? 3.2 : e.type === 'dog' && this.isHidden() ? 0.42 : 2.3 + 7 * v * v);
+      if (before === 0) { e.type === 'dog' ? sfx.sniff() : sfx.suspicious(); e.bubble = { text: e.type === 'dog' ? '*sniff*' : '?', t: 0.9 }; }
       if (e.sus > 0.25) this.seen = true;
       if (e.sus >= 1) this.caught(e);
     } else {
-      e.sus = Math.max(0, e.sus - dt * 1.4);
+      e.sus = Math.max(0, e.sus - dt * (e.type === 'dog' ? 0.5 : 1.4));
     }
   }
 
@@ -531,16 +605,24 @@ export class StealthGame {
       this.particles.push({ k: 'spark', x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 120, life: rand(0.5, 1), max: 1, color, r: rand(3, 7) });
     }
   }
+  puff(x, y, n = 4, color = '#d8c7a8') {
+    for (let i = 0; i < n; i++) this.particles.push({ k: 'puff', x: x + rand(-20, 20), y: y - rand(0, 10), vx: rand(-60, 60), vy: rand(-50, -10), life: rand(0.35, 0.6), max: 0.6, r: rand(8, 16), color });
+  }
   zzz(x, y) { this.particles.push({ k: 'z', x, y, vx: rand(10, 30), vy: -40, life: 2, max: 2, r: rand(20, 28) }); }
-  popText(text, x, y) { this.particles.push({ k: 'text', text, x, y, vx: 0, vy: -60, life: 1.2, max: 1.2 }); }
+  popText(text, x, y, size = 44) { this.particles.push({ k: 'text', text, x, y, vx: 0, vy: -60, life: 1.2, max: 1.2, r: size }); }
 
   update(dt) {
     this.t += dt;
+    const c = this.cam, kk = Math.min(1, dt * 5);
+    c.z = lerp(c.z, c.tz, kk); c.x = lerp(c.x, c.tx, kk); c.y = lerp(c.y, c.ty, kk);
+    if (this.freeze > 0) { this.freeze -= dt; return; }
     if (!this.over || this.pl.state === 'cheer') this.updatePlayer(dt);
     for (const e of this.enemies) this.updateEnemy(e, dt);
     for (const o of this.objects) {
+      if (o.follow) { const e = this.enemy(o.follow); o.x = e.x - e.face * 45; o.floor = e.floor; }
       if (o.cool) o.cool = Math.max(0, o.cool - dt);
-      if (!this.isActive(o) || o.type === 'hide' && !this.hintT) continue;
+      if (o.sq) o.sq *= Math.pow(0.004, dt);
+      if (!this.isActive(o) || o.type === 'hide' && !this.hintT || o.kitten) continue;
       o.spark -= dt;
       if (o.spark <= 0) {
         o.spark = rand(1.6, 3.2);
@@ -551,11 +633,10 @@ export class StealthGame {
     for (const q of this.particles) {
       q.life -= dt; q.x += q.vx * dt; q.y += q.vy * dt;
       if (q.k === 'spark') q.vy += 500 * dt;
+      if (q.k === 'puff') { q.vx *= 0.92; q.r += 18 * dt; }
     }
     this.particles = this.particles.filter(q => q.life > 0);
     this.near = this.over ? null : this.nearestObj();
-    for (const r of this.ripples) r.t += dt;
-    this.ripples = this.ripples.filter(r => r.t < 0.5);
     this.shake *= Math.pow(0.002, dt);
     if (this.hintT > 0) this.hintT -= dt;
     this.L.update && this.L.update(this, dt);
@@ -563,51 +644,78 @@ export class StealthGame {
 
   // ---------- drawing ----------
   draw(ctx) {
-    const L = this.L;
+    const L = this.L, c = this.cam;
     ctx.save();
+    if (c.z > 1.001) {
+      const hw = W / 2 / c.z, hh = H / 2 / c.z;
+      const cx = clamp(c.x, hw, W - hw), cy = clamp(c.y, hh, H - hh);
+      ctx.translate(W / 2, H / 2); ctx.scale(c.z, c.z); ctx.translate(-cx, -cy);
+    }
     if (this.shake > 0.5) ctx.translate(rand(-1, 1) * this.shake, rand(-1, 1) * this.shake);
     ctx.drawImage(IMG[L.bg], 0, 0, W, H);
     L.drawBack && L.drawBack(ctx, this);
 
-    // vision cones & beams under characters
     for (const e of this.enemies) this.drawVision(ctx, e);
-
     for (const l of this.ladders) this.drawLadder(ctx, l);
 
     const p = this.pl;
-    // objects: back layer, then player if hidden, then hide objects, then the rest
-    const hiddenObj = p.state === 'hide' ? p.hideObj : null;
+    const hidingNow = ['hiding', 'hide', 'unhiding'].includes(p.state) && p.hideObj;
     for (const o of this.objects) if (o.z === 'back') this.drawObj(ctx, o);
-    if (hiddenObj) this.drawPip(ctx);
+    if (hidingNow) this.drawHiddenPip(ctx);
     for (const o of this.objects) if (o.z !== 'back' && o.z !== 'front') this.drawObj(ctx, o);
-    // enemies & player sorted by feet
     const actors = this.enemies.filter(e => e.type !== 'beam').map(e => ({ y: this.fy(e.floor) + (e.dy || 0) + (e.type === 'sleeper' ? -1 : 0), d: () => this.drawEnemy(ctx, e) }));
-    if (!hiddenObj) actors.push({ y: p.y + 0.5, d: () => this.drawPip(ctx) });
+    if (!hidingNow) actors.push({ y: p.y + 0.5, d: () => this.drawPip(ctx) });
     actors.sort((a, b) => a.y - b.y).forEach(a => a.d());
     for (const o of this.objects) if (o.z === 'front') this.drawObj(ctx, o);
+    for (const poly of L.occluders || []) this.redrawBg(ctx, poly);
     L.drawFront && L.drawFront(ctx, this);
 
+    if (L.dark) this.drawDarkness(ctx);
     this.drawLights(ctx);
     for (const e of this.enemies) this.drawBubble(ctx, e);
     this.drawParticles(ctx);
     this.drawHighlights(ctx);
     this.drawPrompts(ctx);
-    for (const r of this.ripples) {
-      ctx.strokeStyle = `rgba(255,240,200,${0.7 * (1 - r.t / 0.5)})`; ctx.lineWidth = 4;
-      ctx.beginPath(); ctx.ellipse(r.x, r.y, 20 + r.t * 90, 6 + r.t * 26, 0, 0, Math.PI * 2); ctx.stroke();
-    }
-    // vignette
+    ctx.restore();
+    // vignette (screen space)
     const g = ctx.createRadialGradient(W / 2, H / 2, H * 0.45, W / 2, H / 2, H * 1.05);
     g.addColorStop(0, 'rgba(0,0,0,0)'); g.addColorStop(1, 'rgba(8,4,20,0.55)');
-    ctx.fillStyle = g; ctx.fillRect(-40, -40, W + 80, H + 80);
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  }
+
+  redrawBg(ctx, poly) {
+    ctx.save();
+    ctx.beginPath(); ctx.moveTo(poly[0][0], poly[0][1]);
+    for (let i = 1; i < poly.length; i++) ctx.lineTo(poly[i][0], poly[i][1]);
+    ctx.closePath(); ctx.clip();
+    ctx.drawImage(IMG[this.L.bg], 0, 0, W, H);
     ctx.restore();
   }
 
+  drawDarkness(ctx) {
+    if (!this.darkCv) { this.darkCv = document.createElement('canvas'); this.darkCv.width = W / 4; this.darkCv.height = H / 4; }
+    const d = this.darkCv.getContext('2d'), s = 0.25;
+    d.globalCompositeOperation = 'source-over';
+    d.clearRect(0, 0, W * s, H * s);
+    d.fillStyle = `rgba(3,4,18,${this.L.dark})`; d.fillRect(0, 0, W * s, H * s);
+    d.globalCompositeOperation = 'destination-out';
+    const hole = (x, y, r, a = 1) => {
+      const g = d.createRadialGradient(x * s, y * s, 0, x * s, y * s, r * s);
+      g.addColorStop(0, `rgba(0,0,0,${a})`); g.addColorStop(0.55, `rgba(0,0,0,${a * 0.75})`); g.addColorStop(1, 'rgba(0,0,0,0)');
+      d.fillStyle = g; d.fillRect((x - r) * s, (y - r) * s, r * 2 * s, r * 2 * s);
+    };
+    for (const l of Object.values(this.lamps)) if (l.lit) { hole(l.lx ?? l.x, l.ly ?? l.y, l.r * 1.25 * (0.95 + 0.05 * Math.sin(this.t * 9 + l.x))); hole(l.x, l.y, 90); }
+    for (const e of this.enemies) if (e.lantern) hole(e.x + e.face * 30, this.fy(e.floor) - 90, 210, 0.9);
+    hole(this.pl.x, this.pl.y - 70, 120, 0.35);
+    ctx.drawImage(this.darkCv, 0, 0, W, H);
+  }
+
   drawLadder(ctx, l) {
-    if (l.enabled && !l.enabled(this)) return;
+    if (l.enabled && !l.enabled(this)) { if (l.style === 'lift') this.drawLift(ctx, l, true); return; }
+    if (l.style === 'lift') { this.drawLift(ctx, l, false); return; }
     const top = this.fy(l.top) - (l.topExtra ?? 12), bot = this.fy(l.bottom) + 4;
     if (l.style === 'rope') {
-      const sway = Math.sin(this.t * 1.5) * 3;
+      const sway = Math.sin(this.t * 1.5 + l.x) * 3;
       ctx.lineCap = 'round';
       for (const side of [-22, 22]) {
         ctx.strokeStyle = '#3a2410'; ctx.lineWidth = 7;
@@ -619,10 +727,9 @@ export class StealthGame {
         ctx.strokeStyle = '#3a2410'; ctx.lineWidth = 9; ctx.beginPath(); ctx.moveTo(l.x - 24 + sx, y); ctx.lineTo(l.x + 24 + sx, y); ctx.stroke();
         ctx.strokeStyle = '#9a6b3a'; ctx.lineWidth = 5; ctx.stroke();
       }
-      drawSprite(ctx, 'hook', l.x + 4, top + 26, 0.3, false, 1, 1, 1, Math.PI);
+      if (l.hook) drawSprite(ctx, 'hook', l.x + 4, top + 26, 0.3, false, 1, 1, 1, Math.PI);
       return;
     }
-    // wooden ladder: tile the sprite vertically
     const im = IMG.ladder, sc = l.scale || 0.62;
     const w = im.width * sc, h = im.height * sc;
     ctx.save();
@@ -631,12 +738,35 @@ export class StealthGame {
     ctx.restore();
   }
 
+  drawLift(ctx, l, locked) {
+    const p = this.pl;
+    const riding = p.state === 'climb' && p.climbL === l;
+    const py = riding ? p.y : l.restY;
+    ctx.lineCap = 'round';
+    for (const side of [-62, 62]) {
+      ctx.strokeStyle = '#2a1a0a'; ctx.lineWidth = 6;
+      ctx.beginPath(); ctx.moveTo(l.x + side, l.ropeTop ?? 40); ctx.lineTo(l.x + side, py - 4); ctx.stroke();
+      ctx.strokeStyle = '#a07a48'; ctx.lineWidth = 3; ctx.stroke();
+    }
+    drawSprite(ctx, 'pallet', l.x, py + 22, 0.5);
+    if (locked && l.lockLabel) {
+      ctx.fillStyle = 'rgba(40,22,8,0.6)'; ctx.beginPath(); ctx.arc(l.x, py - 30, 3, 0, 7); ctx.fill();
+    }
+  }
+
   drawObj(ctx, o) {
     if (!this.isVisible(o)) return;
     const fy = this.fy(o.floor) + (o.dy || 0);
-    let y = fy, alpha = 1;
+    let y = fy;
     if (o.bob && !o.done) y += Math.sin(this.t * 2.4 + o.x) * 6;
     if (o.draw) { o.draw(ctx, this, o); return; }
+    if (o.lamp) {
+      const lamp = this.lamps[o.lamp];
+      if (!lamp.lit) {
+        ctx.fillStyle = 'rgba(8,8,16,0.82)';
+        ctx.beginPath(); ctx.ellipse(lamp.x, lamp.y + 4, 20, 30, 0, 0, Math.PI * 2); ctx.fill();
+      }
+    }
     if (o.sprite) {
       const hl = (this.hover === o || this.near === o || this.hintT > 0) && this.isActive(o);
       if (o.glow && !o.done) {
@@ -645,7 +775,9 @@ export class StealthGame {
         ctx.fillStyle = g; ctx.fillRect(o.x - 100, y - 130, 200, 200);
       }
       if (hl) { ctx.save(); ctx.shadowColor = 'rgba(255,225,120,0.95)'; ctx.shadowBlur = 26; }
-      drawSprite(ctx, o.sprite, o.x, y, o.scale || 1, !!o.flip, alpha);
+      const sq = o.sq || 0;
+      const peek = o.kitten ? Math.max(0, Math.sin(this.t * 1.3 + o.x)) * 6 : 0;
+      drawSprite(ctx, o.sprite, o.x, y + peek, o.scale || 1, !!o.flip, 1, 1 + sq * 0.25, 1 - sq * 0.35);
       if (hl) ctx.restore();
     }
     if (o.type === 'exit') this.drawExit(ctx, o);
@@ -671,7 +803,7 @@ export class StealthGame {
 
   pipFrame() {
     const p = this.pl;
-    if (p.state === 'climb') return 'climb';
+    if (p.state === 'climb') return p.climbL && p.climbL.style === 'lift' ? 'idle' : 'climb';
     if (p.state === 'cheer') return 'cheer';
     if (p.state === 'caught') return 'idle';
     if (p.state === 'act') return p.act.pose === 'cheer' ? 'cheer' : (Math.floor(p.animT * 6) % 2 ? 'sneak' : 'idle');
@@ -686,22 +818,21 @@ export class StealthGame {
   drawPip(ctx) {
     const p = this.pl;
     const fr = this.pipFrame();
-    let x = p.x, y = p.y, sx = 1, sy = 1, alpha = 1;
+    let x = p.x, y = p.y, sx = 1, sy = 1;
     const sc = CHAR.pip.scale;
     if (p.state === 'walk') y -= Math.abs(Math.sin(p.animT * 12)) * 5;
     if (p.state === 'idle') { const b = Math.sin(this.t * 2.2) * 0.012; sy += b; sx -= b; }
     if (p.squash > 0.01) { sy -= p.squash; sx += p.squash * 0.8; }
-    if (p.state === 'hide') { alpha = 0.55; }
     if (p.state === 'caught') { x += Math.sin(p.animT * 50) * 4 * Math.max(0, 1 - p.animT); sy += 0.05 * Math.sin(p.animT * 8); }
     if (p.state === 'cheer') y -= Math.abs(Math.sin(p.animT * 7)) * 30;
     let flip = p.face < 0;
-    if (fr === 'climb') { flip = Math.floor(p.animT * 5) % 2 === 1; x = p.climbX; y += 50; }
-    // soft contact shadow
-    if (fr !== 'climb') {
+    const lift = p.state === 'climb' && p.climbL && p.climbL.style === 'lift';
+    if (fr === 'climb') { flip = Math.floor(p.animT * 5) % 2 === 1; x = p.climbL ? p.climbL.x : x; y += 50; }
+    if (fr !== 'climb' && !lift) {
       ctx.fillStyle = 'rgba(0,0,0,0.28)';
       ctx.beginPath(); ctx.ellipse(p.x, p.y + 2, 34, 8, 0, 0, Math.PI * 2); ctx.fill();
     }
-    drawSprite(ctx, 'pip_' + fr, x, y, sc * (fr === 'climb' ? 0.9 : 1), flip, alpha, sx, sy);
+    drawSprite(ctx, PIP + fr, x, y, sc * (fr === 'climb' ? 0.9 : 1), flip, 1, sx, sy);
     if (p.state === 'act') {
       const k = 1 - p.act.t / p.act.max;
       const bx = p.x, by = p.y - 170;
@@ -710,15 +841,62 @@ export class StealthGame {
     }
   }
 
+  /** Pip hopping into a barrel, slipping behind scenery, or crouching under furniture. */
+  drawHiddenPip(ctx) {
+    const p = this.pl, o = p.hideObj, st = this.hideStyle(o);
+    const fy = this.fy(o.floor), sc = CHAR.pip.scale;
+    const k = p.state === 'hiding' ? p.hk : p.state === 'hide' ? 1 : 1 - p.hk;
+    const startX = p.fromX ?? o.x;
+    const peek = p.state === 'hide' ? clamp(Math.min(-p.peekT, 1.4 + p.peekT) * 3, 0, 1) : 0;
+    const flip = p.face < 0;
+    if (st === 'barrel') {
+      const bh = spriteSize('barrel', o.scale || 0.7).h;
+      const rim = fy - bh * 0.9;
+      let x, bottom, fr;
+      if (k < 0.55) {
+        const t = k / 0.55;
+        x = lerp(startX, o.x, t); bottom = lerp(fy, rim, t) - Math.sin(Math.PI * t) * 90; fr = 'walk2';
+      } else {
+        const t = (k - 0.55) / 0.45;
+        x = o.x; bottom = lerp(rim, fy + 26, t * t); fr = 'sneak';
+      }
+      if (peek > 0) { bottom = fy + 26 - peek * 112; fr = 'idle'; }
+      ctx.save();
+      ctx.beginPath(); ctx.rect(0, 0, W, fy - 6); ctx.clip();
+      drawSprite(ctx, PIP + fr, x, bottom, sc, flip);
+      ctx.restore();
+      return;
+    }
+    const bx = o.backX ?? o.x, by = o.backY ?? (fy - (st === 'sprite' ? 10 : 0));
+    const s = sc * lerp(1, o.backScale ?? (st === 'sprite' ? 0.96 : 0.88), ease(k));
+    const x = lerp(startX, bx, ease(k)) + peek * 42 * (o.peekDir || 1);
+    const y = lerp(fy, by, ease(k));
+    const fr = k < 1 ? (Math.floor(p.animT * 8) % 2 ? 'sneak' : 'walk1') : 'sneak';
+    if (st === 'under') {
+      ctx.save();
+      if (k > 0.6 && o.rect) { const r = o.rect; ctx.beginPath(); ctx.rect(r[0], r[1], r[2] - r[0], r[3] - r[1]); ctx.clip(); }
+      ctx.filter = `brightness(${lerp(1, 0.38, ease(k))})`;
+      drawSprite(ctx, PIP + fr, x, y, s, flip);
+      ctx.restore();
+      if (k >= 1 && Math.sin(this.t * 1.7) > -0.9) {
+        ctx.fillStyle = '#fff8dc';
+        for (const dx of [-7, 7]) { ctx.beginPath(); ctx.ellipse(x + dx + (flip ? -8 : 8), y - 62 * (s / sc), 3.5, 4.5, 0, 0, Math.PI * 2); ctx.fill(); }
+      }
+      return;
+    }
+    drawSprite(ctx, PIP + fr, x, y, s, flip);
+    if (st === 'cover' && o.poly) this.redrawBg(ctx, o.poly);
+    // 'sprite' style: the object itself is drawn right after this, covering Pip
+  }
+
   drawEnemy(ctx, e) {
     const fy = this.fy(e.floor) + (e.dy || 0);
     if (e.type === 'sleeper') {
       const wig = e.phase === 'stir' ? Math.sin(this.t * 30) * 0.03 : e.phase === 'awake' ? 0 : Math.sin(this.t * 1.6 + e.x) * 0.02;
       drawSprite(ctx, 'hammock_sleep', e.x, fy, e.scale || 0.75, !!e.flip, 1, 1, 1, wig);
       if (e.phase === 'awake') {
-        // a pair of open eyes glinting over the hammock
         ctx.fillStyle = '#fff'; ctx.strokeStyle = '#2a1606'; ctx.lineWidth = 3;
-        for (const dx of [-12, 12]) { ctx.beginPath(); ctx.ellipse(e.x + dx + (e.eyeDx || 0), fy - 108, 10, 12, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); ctx.fillStyle = '#2a1606'; ctx.beginPath(); ctx.arc(e.x + dx + (e.eyeDx || 0) + Math.sin(this.t * 2) * 4, fy - 106, 4.5, 0, Math.PI * 2); ctx.fill(); ctx.fillStyle = '#fff'; }
+        for (const dx of [-12, 12]) { ctx.beginPath(); ctx.ellipse(e.x + dx, fy - 108, 10, 12, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); ctx.fillStyle = '#2a1606'; ctx.beginPath(); ctx.arc(e.x + dx + Math.sin(this.t * 2) * 4, fy - 106, 4.5, 0, Math.PI * 2); ctx.fill(); ctx.fillStyle = '#fff'; }
       }
       return;
     }
@@ -732,17 +910,16 @@ export class StealthGame {
     let y = fy, sx = 1, sy = 1;
     if (e.mode === 'walk' || e.mode === 'investigate') y -= Math.abs(Math.sin(e.animT * 11)) * 4;
     else { const b = Math.sin(e.animT * 2) * 0.015; sy += b; sx -= b; }
-    if (e.mode === 'alert') { y -= Math.max(0, Math.sin(Math.min(1, e.animT) * Math.PI)) * 0; }
+    if (e.mode === 'alert') { const j = Math.max(0, Math.sin(Math.min(1, e.animT * 3) * Math.PI)); y -= j * 26; }
     ctx.fillStyle = 'rgba(0,0,0,0.3)';
-    ctx.beginPath(); ctx.ellipse(e.x, fy + 2, 50, 11, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(e.x, fy + 2, e.type === 'dog' ? 44 : 50, 11, 0, 0, Math.PI * 2); ctx.fill();
     drawSprite(ctx, e.type + '_' + pose, e.x, y, sc, e.face < 0, 1, sx, sy);
   }
 
   drawVision(ctx, e) {
-    if (this.over && e.mode !== 'alert') { /* keep drawing */ }
     const fy = this.fy(e.floor);
     const hot = Math.min(1, e.sus);
-    const col = (a) => `rgba(${Math.round(255)},${Math.round(236 - 170 * hot)},${Math.round(140 - 100 * hot)},${a})`;
+    const col = (a) => `rgba(255,${Math.round(236 - 170 * hot)},${Math.round(140 - 100 * hot)},${a})`;
     if (e.type === 'beam') {
       const sx = e.src.x, sy = e.src.y, bx = e.bx, hw = e.width / 2;
       ctx.save(); ctx.globalCompositeOperation = 'lighter';
@@ -759,31 +936,33 @@ export class StealthGame {
     if (e.type === 'sleeper') {
       if (e.phase !== 'awake' && e.phase !== 'stir') return;
       const a = e.phase === 'awake' ? 0.26 : 0.08 + 0.06 * Math.sin(this.t * 20);
-      const base = this.fy(e.floor);
-      const g = ctx.createRadialGradient(e.x, base, 10, e.x, base, e.range);
+      const g = ctx.createRadialGradient(e.x, fy, 10, e.x, fy, e.range);
       g.addColorStop(0, col(a)); g.addColorStop(1, col(0));
-      ctx.fillStyle = g; ctx.beginPath(); ctx.ellipse(e.x, base - 40, e.range, 110, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = g; ctx.beginPath(); ctx.ellipse(e.x, fy - 40, e.range, 110, 0, 0, Math.PI * 2); ctx.fill();
       return;
     }
-    const r = this.range(e);
+    if (e.type === 'dog' && e.smell && e.mode !== 'eat' && e.mode !== 'alert') {
+      // scent circle
+      ctx.save(); ctx.setLineDash([8, 10]); ctx.lineDashOffset = -this.t * 30;
+      ctx.strokeStyle = `rgba(190,240,150,${0.35 + 0.4 * hot})`; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.ellipse(e.x, fy, e.smell, 20, 0, 0, Math.PI * 2); ctx.stroke(); ctx.restore();
+    }
+    let r = this.range(e);
     if (r <= 0) return;
-    const eyeY = fy - (e.type === 'parrot' ? 120 : 150);
+    const dim = this.L.dark ? 0.6 : 1;
+    const eyeY = fy - (e.type === 'parrot' ? 120 : e.type === 'dog' ? 70 : 150);
     const x0 = e.x + e.face * 20;
     const x1 = e.x + e.face * r;
     ctx.save();
     ctx.globalCompositeOperation = 'screen';
     const g = ctx.createLinearGradient(x0, 0, x1, 0);
-    g.addColorStop(0, col(0.55)); g.addColorStop(0.75, col(0.28)); g.addColorStop(1, col(0));
+    g.addColorStop(0, col(0.55 * dim)); g.addColorStop(0.75, col(0.28 * dim)); g.addColorStop(1, col(0));
     ctx.fillStyle = g;
     ctx.beginPath();
-    ctx.moveTo(x0, eyeY);
-    ctx.lineTo(x1, fy - 210);
-    ctx.lineTo(x1, fy + 14);
-    ctx.lineTo(x0, fy + 14);
+    ctx.moveTo(x0, eyeY); ctx.lineTo(x1, fy - (e.type === 'dog' ? 120 : 210)); ctx.lineTo(x1, fy + 14); ctx.lineTo(x0, fy + 14);
     ctx.closePath(); ctx.fill();
-    // bright pool where the gaze hits the floor
     const fg = ctx.createLinearGradient(x0, 0, x1, 0);
-    fg.addColorStop(0, col(0.5)); fg.addColorStop(1, col(0));
+    fg.addColorStop(0, col(0.5 * dim)); fg.addColorStop(1, col(0));
     ctx.fillStyle = fg;
     ctx.beginPath(); ctx.ellipse((x0 + x1) / 2, fy + 4, Math.abs(x1 - x0) / 2, 16, 0, 0, Math.PI * 2); ctx.fill();
     ctx.restore();
@@ -795,25 +974,24 @@ export class StealthGame {
     let top;
     if (e.type === 'sleeper') top = fy - 190;
     else if (e.type === 'parrot') top = fy - 200;
-    else if (e.type === 'beam') { top = e.src.y - 60; }
+    else if (e.type === 'beam') top = e.src.y - 60;
     else top = fy - spriteSize(e.type + '_idle', CHAR[e.type].scale).h - 40;
     const x = e.type === 'beam' ? e.src.x : e.x;
     const t = e.bubble.text;
     const big = t === '!';
-    const pop = 1 + Math.max(0, 0.3 - (this.t % 10) * 0) ;
+    const long = t.length > 2;
     ctx.save();
     ctx.translate(x, top + Math.sin(this.t * 6) * 3);
-    ctx.scale(pop, pop);
+    ctx.font = `900 ${big ? 50 : long ? 26 : 40}px Fredoka, "Trebuchet MS", sans-serif`;
+    const rw = long ? ctx.measureText(t).width / 2 + 18 : big ? 34 : 28;
     ctx.fillStyle = big ? '#ff4a3a' : '#fffbe8';
     ctx.strokeStyle = '#2a1606'; ctx.lineWidth = 4;
-    ctx.beginPath(); ctx.ellipse(0, 0, big ? 34 : 28, big ? 38 : 30, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.ellipse(0, 0, rw, big ? 38 : 30, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
     ctx.beginPath(); ctx.moveTo(-8, big ? 34 : 26); ctx.lineTo(0, big ? 52 : 42); ctx.lineTo(8, big ? 34 : 26); ctx.fill();
     ctx.fillStyle = big ? '#fff' : '#3a2410';
-    ctx.font = `900 ${big ? 50 : 40}px Fredoka, "Trebuchet MS", sans-serif`;
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillText(t, 0, 3);
     ctx.restore();
-    // suspicion meter under the bubble
     if (e.sus > 0.02 && !this.over) {
       ctx.fillStyle = 'rgba(30,18,6,0.7)'; roundRect(ctx, x - 36, top - 58, 72, 12, 6); ctx.fill();
       ctx.fillStyle = '#ff6a3a'; roundRect(ctx, x - 33, top - 55, 66 * Math.min(1, e.sus), 6, 3); ctx.fill();
@@ -821,10 +999,11 @@ export class StealthGame {
   }
 
   drawLights(ctx) {
-    const lights = this.L.lights || [];
     ctx.save();
     ctx.globalCompositeOperation = 'lighter';
-    for (const l of lights) {
+    for (const l0 of this.L.lights || []) {
+      const l = l0.id ? this.lamps[l0.id] : l0;
+      if (l.id && !l.lit) continue;
       const fl = l.flicker === false ? 1 : 0.9 + 0.1 * Math.sin(this.t * 9 + l.x) * Math.sin(this.t * 5.3 + l.y);
       const r = l.r * fl;
       const g = ctx.createRadialGradient(l.x, l.y, 0, l.x, l.y, r);
@@ -853,8 +1032,9 @@ export class StealthGame {
 
   drawPrompts(ctx) {
     const p = this.pl;
-    if (this.over || !['idle', 'walk', 'hide'].includes(p.state)) return;
-    if (p.state === 'hide') { this.keycap(ctx, p.x, p.y - 190, 'E', 'Leave'); return; }
+    if (this.over) return;
+    if (p.state === 'hide') { const o = p.hideObj; this.keycap(ctx, o.x - 20, this.objBox(o).y - 36, 'E', 'Leave'); return; }
+    if (!['idle', 'walk'].includes(p.state)) return;
     const o = this.near;
     if (o) {
       const b = this.objBox(o);
@@ -862,19 +1042,20 @@ export class StealthGame {
         ctx.strokeStyle = `rgba(255,220,110,${0.6 + 0.3 * Math.sin(this.t * 6)})`; ctx.lineWidth = 4; ctx.setLineDash([12, 10]);
         roundRect(ctx, b.x, b.y, b.w, b.h, 18); ctx.stroke(); ctx.setLineDash([]);
       }
-      const verb = { hide: 'Hide', pickup: 'Grab', search: 'Search', use: 'Use', noise: 'Use', exit: 'Go' }[o.type];
+      const verb = o.verb || { hide: 'Hide', pickup: o.follow ? 'Pickpocket' : o.kitten ? 'Pet' : 'Grab', search: 'Search', use: 'Use', noise: 'Use', exit: 'Go' }[o.type];
       this.keycap(ctx, o.x - 20, Math.max(40, b.y - 36), 'E', verb);
     }
     const up = this.nearLadder(-1), down = this.nearLadder(1);
-    if (up) this.keycap(ctx, up.l.x + (o ? 70 : 0), p.y - 200, 'W', 'Climb');
-    else if (down) this.keycap(ctx, down.l.x + (o ? 70 : 0), p.y - 200, 'S', 'Climb');
+    const lbl = l => l.style === 'lift' ? 'Ride' : 'Climb';
+    if (up) this.keycap(ctx, up.l.x + (o ? 70 : 0), p.y - 200, 'W', lbl(up.l));
+    else if (down) this.keycap(ctx, down.l.x + (o ? 70 : 0), p.y - 200, 'S', lbl(down.l));
   }
 
   drawHighlights(ctx) {
     if (this.hintT <= 0) return;
     const a = Math.min(1, this.hintT) * (0.6 + 0.4 * Math.sin(this.t * 8));
     for (const o of this.objects) {
-      if (!this.isActive(o)) continue;
+      if (!this.isActive(o) || o.kitten) continue;
       if (o.sprite && o.type !== 'exit') continue;
       const b = this.objBox(o);
       ctx.strokeStyle = `rgba(255,220,110,${a})`; ctx.lineWidth = 4; ctx.setLineDash([12, 10]);
@@ -889,6 +1070,10 @@ export class StealthGame {
         ctx.fillStyle = q.color; ctx.globalAlpha = k;
         ctx.beginPath(); ctx.arc(q.x, q.y, q.r * k + 1, 0, Math.PI * 2); ctx.fill();
         ctx.globalAlpha = 1;
+      } else if (q.k === 'puff') {
+        ctx.fillStyle = q.color; ctx.globalAlpha = k * 0.45;
+        ctx.beginPath(); ctx.arc(q.x, q.y, q.r, 0, Math.PI * 2); ctx.fill();
+        ctx.globalAlpha = 1;
       } else if (q.k === 'twinkle') {
         const s = q.r * Math.sin(k * Math.PI);
         ctx.save(); ctx.translate(q.x, q.y); ctx.globalCompositeOperation = 'lighter';
@@ -896,6 +1081,11 @@ export class StealthGame {
         ctx.beginPath();
         ctx.moveTo(0, -s); ctx.quadraticCurveTo(0, 0, s, 0); ctx.quadraticCurveTo(0, 0, 0, s); ctx.quadraticCurveTo(0, 0, -s, 0); ctx.quadraticCurveTo(0, 0, 0, -s);
         ctx.fill(); ctx.restore();
+      } else if (q.k === 'heart') {
+        ctx.save(); ctx.globalAlpha = Math.min(1, k * 1.5); ctx.translate(q.x, q.y); ctx.scale(q.r / 20, q.r / 20);
+        ctx.fillStyle = '#ff7aa2'; ctx.strokeStyle = '#5a1a2a'; ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.moveTo(0, 8); ctx.bezierCurveTo(-22, -8, -10, -24, 0, -12); ctx.bezierCurveTo(10, -24, 22, -8, 0, 8); ctx.fill(); ctx.stroke();
+        ctx.restore();
       } else if (q.k === 'z') {
         ctx.globalAlpha = Math.min(1, k * 1.5);
         ctx.fillStyle = '#e8f0ff'; ctx.strokeStyle = '#2a1606'; ctx.lineWidth = 4;
@@ -904,7 +1094,7 @@ export class StealthGame {
         ctx.globalAlpha = 1;
       } else if (q.k === 'text') {
         ctx.globalAlpha = Math.min(1, k * 2);
-        ctx.font = '900 44px Fredoka, "Trebuchet MS", sans-serif'; ctx.textAlign = 'center';
+        ctx.font = `900 ${q.r || 44}px Fredoka, "Trebuchet MS", sans-serif`; ctx.textAlign = 'center';
         ctx.lineWidth = 6; ctx.strokeStyle = '#2a1606'; ctx.fillStyle = '#ffe36a';
         ctx.strokeText(q.text, q.x, q.y); ctx.fillText(q.text, q.x, q.y);
         ctx.globalAlpha = 1;

@@ -29,8 +29,10 @@
   <!-- map / level select -->
   <div id="map" class="screen">
     <div id="nodes"></div>
-    <div class="map-head"><span id="starTotal">0</span><img src="assets/img/coin.png" alt=""></div>
+    <div class="map-head"><span class="mh-star">&#9733;</span><span id="starTotal">0</span><img src="assets/img/kitten_sit.png" alt=""><span id="kitTotal">0</span></div>
     <button class="btn small corner-left" id="btnMapBack">Back</button>
+    <button class="btn small corner-left2" id="btnWardrobe"><img src="assets/img/pip_idle.png" alt="">Wardrobe</button>
+    <div class="map-goal">Rescue Grandpa &middot; Bring back the light &middot; Find all 7 kittens</div>
   </div>
 
   <!-- level intro -->
@@ -83,6 +85,7 @@
       <h1 id="resTitle">Level complete!</h1>
       <div class="stars" id="resStars"></div>
       <div class="star-labels" id="resLabels"></div>
+      <div class="res-extra" id="resExtra"></div>
       <div class="row">
         <button class="btn alt" id="btnReplay">Replay</button>
         <button class="btn" id="btnNext">Next</button>
@@ -90,12 +93,32 @@
     </div>
   </div>
 
-  <!-- ending -->
-  <div id="ending" class="screen modal">
+  <!-- story panel -->
+  <div id="panel" class="screen">
+    <div class="caption"><p id="panelText"></p><button class="btn" id="btnPanel">Continue</button></div>
+  </div>
+
+  <!-- wardrobe -->
+  <div id="wardrobe" class="screen modal">
     <div class="parch wide">
-      <img class="pip-cheer" src="assets/img/pip_cheer.png" alt="">
+      <h1>Pip's Wardrobe</h1>
+      <p>Earn stars and rescue kittens to unlock new outfits.</p>
+      <div class="outfits" id="outfits"></div>
+      <button class="btn" id="btnWardrobeBack">Back to the map</button>
+    </div>
+  </div>
+
+  <!-- touch controls (phones / tablets) -->
+  <div id="touch">
+    <div class="tpad left"><button data-k="left">&#9664;</button><button data-k="right">&#9654;</button></div>
+    <div class="tpad right"><button data-k="up">&#9650;</button><button data-k="act" class="act">E</button><button data-k="down">&#9660;</button></div>
+  </div>
+
+  <!-- ending -->
+  <div id="ending" class="screen">
+    <div class="parch wide ending-card">
       <h1>The lighthouse shines again!</h1>
-      <p>Pip sailed the stolen ship home and set the Great Crystal back in its lamp. Tonight, every ship at sea will find its way safely to harbor.</p>
+      <p>Pip and Grandpa sailed the stolen ship home and set the Great Crystal back in its lamp. Tonight, every ship at sea will find its way safely to harbor.</p>
       <p class="thanks">Thanks for playing <b>Pocket Plunder</b></p>
       <div class="stars" id="endStars"></div>
       <div class="row">
